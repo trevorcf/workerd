@@ -20,6 +20,7 @@
 #include "scheduled.h"
 #include "blob.h"
 #include "sockets.h"
+#include "bug.h"
 
 namespace workerd::api {
 
@@ -372,6 +373,8 @@ public:
     JSG_NESTED_TYPE(Response);
     JSG_NESTED_TYPE(WebSocket);
     JSG_NESTED_TYPE(WebSocketPair);
+
+    JSG_NESTED_TYPE(Bug);
 
     JSG_NESTED_TYPE(AbortController);
     JSG_NESTED_TYPE(AbortSignal);
