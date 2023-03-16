@@ -12,9 +12,18 @@
 
 namespace workerd {
 
+#define SQLITE_ASSERT(condition, errMsg, ...) \
+    KJ_IF_MAYBE(onErrorCb, onError) { \
+      if (!(condition)) { \
+        (*onErrorCb)(errMsg); \
+      } \
+    } else { \
+      KJ_ASSERT((condition), "SQLite failed: ", errMsg, ##__VA_ARGS__); \
+    }
+
 #define SQLITE_CALL_NODB(code, ...) do { \
     int _ec = code; \
-    KJ_ASSERT(_ec == SQLITE_OK, "SQLite failed: " #code, sqlite3_errstr(_ec), ##__VA_ARGS__); \
+    SQLITE_ASSERT(_ec == SQLITE_OK, sqlite3_errstr(_ec), " " #code, ##__VA_ARGS__) \
   } while (false)
 // Make a SQLite call and check the returned error code. Use this version when the call is not
 // associated with an open DB connection.
@@ -23,14 +32,14 @@ namespace workerd {
     int _ec = code; \
     /* SQLITE_MISUSE doesn't put error info on the database object, so check it separately */ \
     KJ_ASSERT(_ec != SQLITE_MISUSE, "SQLite misused: " #code, ##__VA_ARGS__); \
-    KJ_ASSERT(_ec == SQLITE_OK, "SQLite failed: " #code, sqlite3_errmsg(db), ##__VA_ARGS__); \
+    SQLITE_ASSERT(_ec == SQLITE_OK, sqlite3_errmsg(db), " " #code, ##__VA_ARGS__); \
   } while (false)
 // This version requires the scope to contain a variable named `db` which is of type sqlite3*, or
 // can convert to it.
 
 #define SQLITE_CALL_FAILED(code, error, ...) do { \
     KJ_ASSERT(error != SQLITE_MISUSE, "SQLite misused: " code, ##__VA_ARGS__); \
-    KJ_ASSERT(error == SQLITE_OK, "SQLite failed: " code, sqlite3_errmsg(db), ##__VA_ARGS__); \
+    SQLITE_ASSERT(error == SQLITE_OK, sqlite3_errmsg(db), " " code, ##__VA_ARGS__); \
   } while (false);
 // Version of `SQLITE_CALL` that can be called after inspecting the error code, in case some codes
 // aren't really errors.
@@ -63,12 +72,12 @@ kj::Own<T> ownSqlite(T* obj) {
 
 // =======================================================================================
 
-SqliteDatabase::SqliteDatabase(Vfs& vfs, kj::PathPtr path) {
+SqliteDatabase::SqliteDatabase(Vfs& vfs, kj::PathPtr path, ErrorCallback onErrorCb): onError(kj::mv(onErrorCb)) {
   SQLITE_CALL_NODB(sqlite3_open_v2(path.toString().cStr(), &db,
                                    SQLITE_OPEN_READONLY, vfs.getName().cStr()));
 }
 
-SqliteDatabase::SqliteDatabase(Vfs& vfs, kj::PathPtr path, kj::WriteMode mode) {
+SqliteDatabase::SqliteDatabase(Vfs& vfs, kj::PathPtr path, ErrorCallback onErrorCb, kj::WriteMode mode): onError(kj::mv(onErrorCb)) {
   int flags = SQLITE_OPEN_READWRITE;
   if (kj::has(mode, kj::WriteMode::CREATE)) {
     flags |= SQLITE_OPEN_CREATE;
@@ -97,27 +106,27 @@ SqliteDatabase::~SqliteDatabase() noexcept(false) {
   KJ_REQUIRE(err == SQLITE_OK, sqlite3_errstr(err)) { break; }
 }
 
-kj::Own<sqlite3_stmt> SqliteDatabase::prepareSql(sqlite3* db, kj::StringPtr sqlCode, uint prepFlags,
+kj::Own<sqlite3_stmt> SqliteDatabase::prepareSql(sqlite3* db, ErrorCallback& onError, kj::StringPtr sqlCode, uint prepFlags,
                                                  Multi multi) {
   for (;;) {
     sqlite3_stmt* result;
     const char* tail;
 
     SQLITE_CALL(sqlite3_prepare_v3(db, sqlCode.begin(), sqlCode.size(), prepFlags, &result, &tail));
-    KJ_REQUIRE(result != nullptr, "SQL code did not contain a statement", sqlCode);
+    SQLITE_ASSERT(result != nullptr, "SQL code did not contain a statement", sqlCode);
     auto ownResult = ownSqlite(result);
 
     while (*tail == ' ' || *tail == '\n') ++tail;
 
     switch (multi) {
       case SINGLE:
-        KJ_REQUIRE(tail == sqlCode.end(), "sqlite statement had leftover code", tail);
+        SQLITE_ASSERT(tail == sqlCode.end(), "sqlite statement had leftover code", tail);
         break;
 
       case MULTI:
         if (tail != sqlCode.end()) {
-          KJ_REQUIRE(sqlite3_bind_parameter_count(result) == 0,
-              "only the last statement in a multi-statement query can have parameters");
+          //SQLITE_ASSERT(sqlite3_bind_parameter_count(result) == 0,
+          //    "only the last statement in a multi-statement query can have parameters");
 
           // This isn't the last statement in the code. Execute it immediately.
           int err = sqlite3_step(result);
@@ -140,8 +149,8 @@ kj::Own<sqlite3_stmt> SqliteDatabase::prepareSql(sqlite3* db, kj::StringPtr sqlC
   }
 }
 
-SqliteDatabase::Statement SqliteDatabase::prepare(kj::StringPtr sqlCode) {
-  return Statement(*this, prepareSql(db, sqlCode, SQLITE_PREPARE_PERSISTENT, SINGLE));
+SqliteDatabase::Statement SqliteDatabase::prepare(kj::StringPtr sqlCode, ErrorCallback onError) {
+  return Statement(*this, prepareSql(db, onError, sqlCode, SQLITE_PREPARE_PERSISTENT, SINGLE));
 }
 
 SqliteDatabase::Query::Query(SqliteDatabase& db, Statement& statement,
@@ -150,9 +159,9 @@ SqliteDatabase::Query::Query(SqliteDatabase& db, Statement& statement,
   init(bindings);
 }
 
-SqliteDatabase::Query::Query(SqliteDatabase& db, kj::StringPtr sqlCode,
+SqliteDatabase::Query::Query(SqliteDatabase& db, kj::StringPtr sqlCode, ErrorCallback& onError,
                              kj::ArrayPtr<const ValuePtr> bindings)
-    : db(db), ownStatement(prepareSql(db, sqlCode, 0, SINGLE)), statement(ownStatement) {
+    : db(db), ownStatement(prepareSql(db, onError, sqlCode, 0, MULTI)), statement(ownStatement) {
   init(bindings);
 }
 
@@ -171,8 +180,9 @@ SqliteDatabase::Query::~Query() noexcept(false) {
 }
 
 void SqliteDatabase::Query::checkRequirements(size_t size) {
+  ErrorCallback onError = nullptr; // TEMP
   KJ_REQUIRE(!sqlite3_stmt_busy(statement), "only one Query can run at a time");
-  KJ_REQUIRE(size == sqlite3_bind_parameter_count(statement),
+  SQLITE_ASSERT(size == sqlite3_bind_parameter_count(statement),
       "wrong number of bindings for SQLite query");
 }
 
@@ -187,6 +197,8 @@ void SqliteDatabase::Query::init(kj::ArrayPtr<const ValuePtr> bindings) {
 }
 
 void SqliteDatabase::Query::bind(uint i, ValuePtr value) {
+  ErrorCallback onError = nullptr; // TEMP
+
   KJ_SWITCH_ONEOF(value) {
     KJ_CASE_ONEOF(blob, kj::ArrayPtr<const byte>) {
       SQLITE_CALL(sqlite3_bind_blob(statement, i+1, blob.begin(), blob.size(), SQLITE_STATIC));
@@ -207,26 +219,32 @@ void SqliteDatabase::Query::bind(uint i, ValuePtr value) {
 }
 
 void SqliteDatabase::Query::bind(uint i, kj::ArrayPtr<const byte> value) {
+  ErrorCallback onError = nullptr; // TEMP
   SQLITE_CALL(sqlite3_bind_blob(statement, i+1, value.begin(), value.size(), SQLITE_STATIC));
 }
 
 void SqliteDatabase::Query::bind(uint i, kj::StringPtr value) {
+  ErrorCallback onError = nullptr; // TEMP
   SQLITE_CALL(sqlite3_bind_text(statement, i+1, value.begin(), value.size(), SQLITE_STATIC));
 }
 
 void SqliteDatabase::Query::bind(uint i, long long value) {
+  ErrorCallback onError = nullptr; // TEMP
   SQLITE_CALL(sqlite3_bind_int64(statement, i+1, value));
 }
 
 void SqliteDatabase::Query::bind(uint i, double value) {
+  ErrorCallback onError = nullptr; // TEMP
   SQLITE_CALL(sqlite3_bind_double(statement, i+1, value));
 }
 
 void SqliteDatabase::Query::bind(uint i, decltype(nullptr)) {
+  ErrorCallback onError = nullptr; // TEMP
   SQLITE_CALL(sqlite3_bind_null(statement, i+1));
 }
 
 void SqliteDatabase::Query::nextRow() {
+  ErrorCallback onError = nullptr; // TEMP
   int err = sqlite3_step(statement);
   if (err == SQLITE_DONE) {
     done = true;
@@ -255,6 +273,24 @@ SqliteDatabase::Query::ValuePtr SqliteDatabase::Query::getValue(uint column) {
     case SQLITE_NULL:    return nullptr;
   }
   KJ_UNREACHABLE;
+}
+
+SqliteDatabase::Query::ValueOwned SqliteDatabase::Query::getValueOwned(uint column) {
+  switch (sqlite3_column_type(statement, column)) {
+    case SQLITE_INTEGER: {
+      int64_t value = getInt64(column);
+      return static_cast<double>(value);
+    }
+    case SQLITE_FLOAT:   return getDouble(column);
+    case SQLITE_TEXT:    return kj::heapString(getText(column));
+    case SQLITE_BLOB:    return kj::heapArray<const byte>(getBlob(column));
+    case SQLITE_NULL:    return nullptr;
+  }
+  KJ_UNREACHABLE;
+}
+
+kj::StringPtr SqliteDatabase::Query::getColumnName(uint column) {
+  return sqlite3_column_name(statement, column);
 }
 
 kj::ArrayPtr<const byte> SqliteDatabase::Query::getBlob(uint column) {

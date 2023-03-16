@@ -19,6 +19,7 @@ namespace workerd {
 
 using kj::byte;
 using kj::uint;
+using ErrorCallback = kj::Maybe<kj::Function<void(const char*)>>;
 
 class SqliteDatabase {
   // C++/KJ API for SQLite.
@@ -34,8 +35,8 @@ public:
   class Query;
   class Statement;
 
-  SqliteDatabase(Vfs& vfs, kj::PathPtr path);
-  SqliteDatabase(Vfs& vfs, kj::PathPtr path, kj::WriteMode mode);
+  SqliteDatabase(Vfs& vfs, kj::PathPtr path, ErrorCallback onError);
+  SqliteDatabase(Vfs& vfs, kj::PathPtr path, ErrorCallback onError, kj::WriteMode mode);
   ~SqliteDatabase() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SqliteDatabase);
 
@@ -43,7 +44,7 @@ public:
   // Allows a SqliteDatabase to be passed directly into SQLite API functions where `sqlite*` is
   // expected.
 
-  Statement prepare(kj::StringPtr sqlCode);
+  Statement prepare(kj::StringPtr sqlCode, ErrorCallback onError = nullptr);
   // Prepares the given SQL code as a persistent statement that can be used across several queries.
   // Don't use this for one-off queries; pass the code to the Query constructor.
 
@@ -59,12 +60,14 @@ public:
 private:
   sqlite3* db;
 
+  ErrorCallback onError;
+
   void close();
 
   enum Multi { SINGLE, MULTI };
 
   static kj::Own<sqlite3_stmt> prepareSql(
-      sqlite3* db, kj::StringPtr sqlCode, uint prepFlags, Multi multi);
+      sqlite3* db, ErrorCallback& onError, kj::StringPtr sqlCode, uint prepFlags, Multi multi);
   // Helper to call sqlite3_prepare_v3().
   //
   // In SINGLE mode, an exception is thrown if `sqlCode` contains multiple statements.
@@ -103,6 +106,8 @@ class SqliteDatabase::Query {
 public:
   using ValuePtr = kj::OneOf<kj::ArrayPtr<const byte>, kj::StringPtr, int64_t, double,
                              decltype(nullptr)>;
+  using ValueOwned = kj::OneOf<kj::Array<const byte>, kj::String, int64_t, double,
+                             decltype(nullptr)>;
 
   Query(SqliteDatabase& db, Statement& statement, kj::ArrayPtr<const ValuePtr> bindings);
   // Begin a query executing a prepared statement.
@@ -111,7 +116,7 @@ public:
   // need only live until the constructor returns, but any strings or blobs it points to must
   // remain valid until the Query is destroyed.
 
-  Query(SqliteDatabase& db, kj::StringPtr sqlCode, kj::ArrayPtr<const ValuePtr> bindings);
+  Query(SqliteDatabase& db, kj::StringPtr sqlCode, ErrorCallback& onError, kj::ArrayPtr<const ValuePtr> bindings);
   // Begin a one-off query executing some code directly.
 
   template <typename... Params>
@@ -120,8 +125,8 @@ public:
     bindAll(std::index_sequence_for<Params...>(), kj::fwd<Params>(bindings)...);
   }
   template <typename... Params>
-  Query(SqliteDatabase& db, kj::StringPtr sqlCode, Params&&... bindings)
-      : db(db), ownStatement(prepareSql(db, sqlCode, 0, MULTI)), statement(ownStatement) {
+  Query(SqliteDatabase& db, ErrorCallback& onError, kj::StringPtr sqlCode, Params&&... bindings)
+      : db(db), ownStatement(prepareSql(db, onError, sqlCode, 0, MULTI)), statement(ownStatement) {
     bindAll(std::index_sequence_for<Params...>(), kj::fwd<Params>(bindings)...);
   }
   // These versions of the constructor accept the binding values as positional parameters. This
@@ -148,6 +153,12 @@ public:
   //
   // Returned pointers (strings and blobs) remain valid only until either (a) nextRow() is called,
   // or (b) a different get method is called on the same column but with a different type.
+
+  ValueOwned getValueOwned(uint column);
+  // Get the value at the given column, as whatever type was actually returned.
+
+  kj::StringPtr getColumnName(uint column);
+  // Get the name of a specific column.
 
   kj::ArrayPtr<const byte> getBlob(uint column);
   kj::StringPtr getText(uint column);
@@ -258,7 +269,7 @@ private:
 
 template <typename... Params>
 SqliteDatabase::Query SqliteDatabase::run(kj::StringPtr sqlCode, Params&&... params) {
-  return Query(*this, sqlCode, kj::fwd<Params>(params)...);
+  return Query(*this, onError, sqlCode, kj::fwd<Params>(params)...);
 }
 
 template <typename... Params>
